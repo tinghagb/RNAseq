@@ -1,0 +1,247 @@
+#clear global envi Ctrl+Shift+F10
+library(dplyr)
+library(Seurat)
+library(patchwork)
+
+packageVersion('Seurat')
+
+# Load the tissue ILC dataset
+ILC.data_lung <- Read10X(data.dir = "~/Workspace/GSE117568_RAW/lung")
+ILC.data_SI <- Read10X(data.dir = "~/Workspace/GSE117568_RAW/SI")
+ILC.data_skin <- Read10X(data.dir = "~/Workspace/GSE117568_RAW/skin")
+
+# Initialize the Seurat object with the raw (non-normalized data).
+ILC_lung <- CreateSeuratObject(counts = ILC.data_lung, project = "lung", min.cells = 3, min.features = 200)
+ILC_SI <- CreateSeuratObject(counts = ILC.data_SI, project = "SI", min.cells = 3, min.features = 200)
+ILC_skin <- CreateSeuratObject(counts = ILC.data_skin, project = "skin", min.cells = 3, min.features = 200)
+
+ILC_lung
+ILC_SI
+ILC_skin
+
+#Merge differenct tissue ILC
+ILC_total<- merge(ILC_lung, y = c(ILC_SI, ILC_skin), add.cell.ids = c("lung", "SI", "skin"), project = "tissue ILC")
+
+# What does the matrix look like?
+# Lets examine a few genes in the first thirty cells
+ILC.data_lung[c("Il5", "Il13", "Areg"), 1:30]
+ILC.data_SI[c("Il5", "Il13", "Areg"), 1:30]
+ILC.data_skin[c("Il5", "Il13", "Areg"), 1:30]
+#The . values in the matrix represent 0s (no molecules detected). Since most values in an scRNA-seq matrix are 0, Seurat uses a sparse-matrix representation whenever possible. This results in significant memory and speed savings for Drop-seq/inDrop/10x data.
+
+dense.size_lung <- object.size(as.matrix(ILC.data_lung))
+dense.size_lung
+
+sparse.size_lung<- object.size(ILC.data_lung)
+sparse.size_lung
+
+
+#Standard pre-processing workflow
+#QC and selecting 
+# The [[ operator can add columns to object metadata. This is a great place to stash QC stats
+ILC_total[["percent.mt"]] <- PercentageFeatureSet(ILC_total, pattern = "^MT-")
+ILC_lung[["percent.mt"]] <- PercentageFeatureSet(ILC_lung, pattern = "^MT-")
+ILC_SI[["percent.mt"]] <- PercentageFeatureSet(ILC_SI, pattern = "^MT-")
+ILC_skin[["percent.mt"]] <- PercentageFeatureSet(ILC_skin, pattern = "^MT-")
+
+
+#Inspect QC metric
+#The number of unique genes and total molecules are automatically calculated during CreateSeuratObject
+#You can find them stored in the object meta data
+# Show QC metrics for the first 5 cells
+head(ILC_total@meta.data, 5)
+head(ILC_lung@meta.data, 5)
+head(ILC_SI@meta.data, 5)
+head(ILC_skin@meta.data, 5)
+# Visualize QC metrics as a violin plot
+VlnPlot(ILC_total, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+
+
+VlnPlot(ILC_lung, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+VlnPlot(ILC_SI, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+VlnPlot(ILC_skin, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+
+# FeatureScatter is typically used to visualize feature-feature relationships, but can be used
+# for anything calculated by the object, i.e. columns in object metadata, PC scores etc.
+
+plot1 <- FeatureScatter(ILC_total, feature1 = "nCount_RNA", feature2 = "percent.mt")
+plot2 <- FeatureScatter(ILC_total, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+plot1 + plot2
+
+#select the high quality one
+ILC_total <- subset(ILC_total, subset = nFeature_RNA > 200 & nFeature_RNA < 3500 & percent.mt < 5)
+
+#NORMALIZE
+#By default, we employ a global-scaling normalization method “LogNormalize” that normalizes the feature expression measurements for each cell by the total expression, multiplies this by a scale factor (10,000 by default), and log-transforms the result.
+ILC_total_norm <- NormalizeData(ILC_total, normalization.method = "LogNormalize", scale.factor = 10000)
+
+#Identification of highly variable features (feature selection)
+ILC_total_norm <- FindVariableFeatures(ILC_total_norm, selection.method = "vst", nfeatures = 2000)
+ILC_total <- FindVariableFeatures(ILC_total, selection.method = "vst", nfeatures = 2000)
+# Identify the 20 most highly variable genes
+top20_norm <- head(VariableFeatures(ILC_total_norm), 20)
+top20_norm
+top20 <- head(VariableFeatures(ILC_total), 20)
+top20
+
+# plot variable features with and without labels
+plot3 <- VariableFeaturePlot(ILC_total_norm)
+plot3
+plot4 <- LabelPoints(plot = plot3, points = top20_norm, repel = TRUE)
+plot4
+
+#Scaling the data; apply linear transformation that is a preprocessing step prior to PCA
+#Shifts the expression of each gene, so that the mean expression across cells is 0
+#Scales the expression of each gene, so that the variance across cells is 1
+#This step gives equal weight in downstream analyses, so that highly-expressed genes do not dominate
+#The results of this are stored in pbmc[["RNA"]]@scale.data
+
+all.genes <- rownames(ILC_total_norm)
+ILC_total_norm <- ScaleData(ILC_total_norm, features = all.genes)
+
+#Perform linear dimensional reduction
+ILC_total_norm <- RunPCA(ILC_total_norm, features = VariableFeatures(object = ILC_total_norm))
+
+#Seurat provides several useful ways of visualizing both cells and features that define the PCA, including VizDimReduction, DimPlot, and DimHeatmap
+
+#1:VizDimLoadings
+VizDimLoadings(ILC_total_norm, dims = 1:2, reduction = "pca")
+#2
+DimPlot(ILC_total_norm, reduction = "pca")
+#3
+DimHeatmap(ILC_total_norm, dims = 1:3, cells = 500, balanced = TRUE)
+
+
+
+#Cluster the cells
+#As in PhenoGraph, we first construct a KNN graph based on the euclidean distance in PCA space, and refine the edge weights between any two cells based on the shared overlap in their local neighborhoods (Jaccard similarity). This step is performed using the FindNeighbors function, and takes as input the previously defined dimensionality of the dataset (first 10 PCs)
+ILC_total_norm <- FindNeighbors(ILC_total_norm, dims = 1:10)
+# Look at cluster IDs of the first 5 cells
+head(Idents(ILC_total_norm), 5)
+#non-linear dimensional reduction (UMAP/tSNE)
+# If you haven't installed UMAP, you can do so via reticulate::py_install(packages =
+# 'umap-learn')
+ILC_total_norm <- RunUMAP(ILC_total_norm, dims = 1:10)
+# note that you can set `label = TRUE` or use the LabelClusters function to help label
+# individual clusters
+DimPlot(ILC_total_norm, reduction = "umap")
+
+
+
+#To cluster the cells, we next apply modularity optimization techniques such as the Louvain algorithm (default) or SLM [SLM, Blondel et al., Journal of Statistical Mechanics], to iteratively group cells together, with the goal of optimizing the standard modularity function. The FindClusters function implements this procedure
+#We find that setting this parameter between 0.4-1.2 typically returns good results for single-cell datasets of around 3K cells
+ILC_total_norm <- FindClusters(ILC_total_norm, resolution = 0.5)
+
+# Look at cluster IDs of the first 5 cells
+head(Idents(ILC_total_norm), 5)
+
+#non-linear dimensional reduction (UMAP/tSNE)
+# If you haven't installed UMAP, you can do so via reticulate::py_install(packages =
+# 'umap-learn')
+ILC_total_norm <- RunUMAP(ILC_total_norm, dims = 1:10)
+# note that you can set `label = TRUE` or use the LabelClusters function to help label
+# individual clusters
+DimPlot(ILC_total_norm, reduction = "umap")
+
+
+#As in PhenoGraph, we first construct a KNN graph based on the euclidean distance in PCA space, and refine the edge weights between any two cells based on the shared overlap in their local neighborhoods (Jaccard similarity). This step is performed using the FindNeighbors function, and takes as input the previously defined dimensionality of the dataset (first 10 PCs)
+#ILC_total_norm <- FindNeighbors(ILC_total_norm, dims = 1:10)
+#To cluster the cells, we next apply modularity optimization techniques such as the Louvain algorithm (default) or SLM [SLM, Blondel et al., Journal of Statistical Mechanics], to iteratively group cells together, with the goal of optimizing the standard modularity function. The FindClusters function implements this procedure
+#We find that setting this parameter between 0.4-1.2 typically returns good results for single-cell datasets of around 3K cells
+#ILC_total_norm <- FindClusters(ILC_total_norm, resolution = 0.4)
+#non-linear dimensional reduction (UMAP/tSNE)
+# If you haven't installed UMAP, you can do so via reticulate::py_install(packages =
+# 'umap-learn')
+#ILC_total_norm_umap <- RunUMAP(ILC_total_norm, dims = 1:10)
+# note that you can set `label = TRUE` or use the LabelClusters function to help label
+# individual clusters
+#DimPlot(ILC_total_norm_umap, reduction = "umap")
+
+#Finding differentially expressed features (cluster biomarkers)
+# find all markers of cluster 1
+#it identifes positive and negative markers of a single cluster (specified in ident.1
+#The min.pct argument requires a feature to be detected at a minimum percentage in either of the two groups of cells, and the thresh.test argument requires a feature to be differentially expressed (on average) by some amount between the two groups.
+cluster1.markers <- FindMarkers(ILC_total_norm, ident.1 = 1, min.pct = 0.25)
+head(cluster1.markers, n = 5)
+
+# find all markers distinguishing cluster 5 from clusters 0 and 3
+#cluster5.markers <- FindMarkers(ILC_total_norm, ident.1 = 5, ident.2 = c(0, 3), min.pct = 0.25)
+#head(cluster5.markers, n = 5)
+# find markers for every cluster compared to all remaining cells, report only the positive ones
+ILC.markers <- FindAllMarkers(ILC_total_norm, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+ILC.markers %>% 
+  group_by(cluster) %>% 
+  top_n(n = 5, wt = avg_logFC)
+
+#Save the list
+write.csv(ILC.markers, "~/Workspace/GSE117568_RAW/ILC_marker.csv", row.names = TRUE)
+
+
+
+
+
+
+#plot gene of interest
+VlnPlot(ILC_total_norm, features = c("Il5", "Il13", "Areg"))
+# you can plot raw counts as well
+VlnPlot(ILC_total_norm, features = c("Il5", "Il13", "Areg"), slot = "counts", log = TRUE)
+
+#Plot the feature
+FeaturePlot(ILC_total_norm, features = c("Gata3", "Il7r", "Il1rl1", "Il17rb", "Il18r1", "Alox5","Ltb4r1", "Cysltr1", "Cysltr2", "Lta4h", "Ltc4s"))
+FeaturePlot(ILC_total_norm, features = c("Il5", "Il13", "Areg", "Arg1", "Ptgs1", "Ptgs2","Hpgds", "Ptgdr1", "Ptgdr2"))
+
+
+#DoHeatmap generates an expression heatmap for given cells and features. In this case, we are plotting the top 20 markers (or all markers if less than 20) for each cluster.
+top10 <- ILC.markers %>% 
+  group_by(cluster) %>% 
+  top_n(n = 10, wt = avg_logFC)
+top10
+write.csv(top10, "~/Workspace/GSE117568_RAW/ILC_marker_top10.csv", row.names = TRUE)
+
+DoHeatmap(ILC_total_norm, features = top10$gene) + NoLegend()
+
+
+new.cluster.ids <- c("Skin ILC2", "Lung ILC2 1", "Lung ILC 2", "Gut ILC2 1", "Gut ILC2 2", "Lung ILC2 Areg", 
+                     "Gut ILC2 Hes1", "Ccr10 ILC2", "Stmn1 ILC2", "9", "10")
+names(new.cluster.ids) <- levels(ILC_total_norm)
+ILC_total_norm <- RenameIdents(ILC_total_norm, new.cluster.ids)
+DimPlot(ILC_total_norm, reduction = "umap", label = TRUE, pt.size = 0.6) + NoLegend()
+
+
+
+
+#Run ST2+ vs ST2- Gut ILC2
+#Extract the cell barcode that St2 >0 or St2 = 0
+library(dplyr)
+ILC.data_SI["Il1rl1", ]
+class(ILC.data_SI_St2)
+
+ILC.data_SI_ST2_0 <- ILC.data_SI[ ,ILC.data_SI["Il1rl1",] == 0]
+ILC.data_SI_ST2_0["Il1rl1", ]
+ILC.data_SI_ST2_po <- ILC.data_SI[ ,ILC.data_SI["Il1rl1",] > 0]
+ILC.data_SI_ST2_po["Il1rl1", ]
+
+ILC_SI_ST2_0 <- CreateSeuratObject(counts = ILC.data_SI_ST2_0, project = "ST2-", min.cells = 3, min.features = 200)
+ILC_SI_ST2_po<- CreateSeuratObject(counts = ILC.data_SI_ST2_po, project = "ST2+", min.cells = 3, min.features = 200)
+
+ILC_SI_ST2<- merge(ILC_SI_ST2_0, y = ILC_SI_ST2_po, add.cell.ids = c("ST2-", "ST2+"))
+
+levels(ILC_SI_ST2)
+#Normalization
+ILC_SI_ST2_norm <- NormalizeData(ILC_SI_ST2, normalization.method = "LogNormalize", scale.factor = 10000)
+#DE analysis by levels
+levels(ILC_SI_ST2_norm)
+gut_ILC_ST2_markers <- FindMarkers(ILC_SI_ST2_norm, ident.1 = "ST2-", ident.2 = "ST2+")
+
+gut_ILC_ST2_markers %>% 
+  top_n(n = 5, wt = avg_logFC)
+
+#Save the list
+write.csv(gut_ILC_ST2_markers, "~/Workspace/GSE117568_RAW/gutILC_ST2+-_marker.csv", row.names = TRUE)
+#read back with column name = gene (added manually)
+gut_ILC_ST2_markers <- read.csv("~/Workspace/GSE117568_RAW/gutILC_ST2+-_marker.csv", header = TRUE)
+head(gut_ILC_ST2_markers)
+top30 <- gut_ILC_ST2_markers %>% 
+  top_n(n = -30, wt = p_val_adj)
+head(top30)
+DoHeatmap(ILC_SI_ST2_norm, features = top30$gene) + NoLegend()
